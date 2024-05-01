@@ -1,0 +1,165 @@
+stages:
+  - "build"
+  - "test"
+  - "deploy"
+  - "finish"
+
+# Use the same Docker image as your Dockerfile
+image: python:3
+
+variables:
+  # -------------- GitLab Configuration Variables -----------------------------
+  REPO_TAG: registry.gitlab.com/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME} # the GitLab tag for docker push and pull
+  
+  #----------GCP Configuration Variables---------------
+
+  #northamerica-northeast2-docker.pkg.dev/lambtoncollege/team-project-repo
+
+  GCP_AR_REGION: northamerica-northeast2-docker.pkg.dev # regin of the artifact in the gcp
+  PROJECT_ID: lambtoncollege  # name of your GCP project ID
+  ARTIFACT_REGISTRY_REPOSITORY: team-project-repo # name of your artifact registry repository
+  GCP_AR_TAG: northamerica-northeast2-docker.pkg.dev/lambtoncollege/team-project-repo # the GCP tag for docker push and pull
+  SERVICE_ACCOUNT_USER:  serviceaccount@lambtoncollege.iam.gserviceaccount.com # service account email with read/write access to artifact registry
+
+   # --------------- Main Pipeline Configuration --------------------------------
+  IMAGE_NAME: "todo-list"
+  IMAGE_TAG: ${GCP_AR_TAG}/${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} # dynamic tag of the image based on GitLab container registry or GCP artifact registry
+  RUNNER_TAG: team-project-runner
+
+  
+
+# GitLab built-in security templates
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+
+.gcloud_auth:
+  script:
+    - # You need to set the up the followings if the VM does not have the required service account as the identity -----
+      # set the project ID for the runner (to know what project to access)
+    - gcloud config set project $PROJECT_ID
+      #  set the service account with the right access
+    - gcloud config set account $SERVICE_ACCOUNT_USER
+      # authenticating the VM with the artifact registry repository
+    - gcloud auth configure-docker \northamerica-northeast2-docker.pkg.dev
+      
+
+initialize-job:
+  stage: ".pre"
+  script:
+    - "echo $CI_COMMIT_BRANCH. This is our commit branch name."
+    - "echo $CI_COMMIT_SHA. This is our unique commit SHA value."
+
+
+build:
+  stage: "build"
+  tags:
+    - ${RUNNER_TAG}
+
+  before_script:
+      # Login to GitLab container registry (if not using the GCP artifact registry)
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    # authenticating the VM with the artifact registry repository
+    - gcloud auth configure-docker $GCP_AR_REGION
+    
+  script:
+
+    - echo "Build job started"
+    - echo "Building Docker image"
+
+    #- docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    # build the docker image using the Dockerfile
+    #- docker build -t ${IMAGE_TAG} .
+
+    # Pushing the docker image to the associated artifact registry depending on the tag (GitLab or GCP)
+    #- docker push ${IMAGE_TAG}
+
+    # Creating .env for linux based runner
+    - echo ${DB_USERNAME} ${DB_PASSWORD} ${CLUSTER_ENDPOINT} > .env
+
+    # build the docker image using the DockerfileBaseImage
+    - docker build -t ${IMAGE_TAG} .
+
+    # Pushing the docker image to the associated artifact registry depending on the tag (GitLab or GCP)
+    - docker push ${IMAGE_TAG}
+
+# Define the job for unittest
+test:
+  stage: test
+  tags:
+    - ${RUNNER_TAG}
+
+  before_script:
+
+    # authenticating the VM with the artifact registry repository
+    - gcloud auth configure-docker $GCP_AR_REGION
+  needs:
+      - "build"
+  script:
+    # Run Docker container with the same commands as in your Dockerfile
+    - docker build -t myapp .
+    - docker run myapp python manage.py test
+
+
+semgrep-sast:
+  stage: "test"
+  needs:
+      - "build"
+  artifacts:
+    when: always
+    expire_in: 30 days
+
+
+
+secret_detection:
+  stage: "test"
+  needs:
+    - "build"
+  artifacts:
+    when: always
+    expire_in: 30 days
+
+
+container_scanning:
+  stage: "test"
+  variables:
+    CS_IMAGE: ${IMAGE_TAG}
+    CS_DOKCERFILE_PATH: ./Dockerfile
+  needs:
+    - "build"
+  artifacts:
+    when: always
+    expire_in: 30 days
+
+deploy:
+  stage: "deploy"
+  tags:
+    - ${RUNNER_TAG}
+
+  before_script:
+      # Login to GitLab container registry (if not using the GCP artifact registry)
+    #- docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+
+    - gcloud auth configure-docker $GCP_AR_REGION
+
+
+  script:
+    - echo "Deploy job started"
+    - docker pull ${IMAGE_TAG}
+    - docker rm -f $IMAGE_NAME 
+      # replace $GCP_AR_TAG with $REPO_TAG if you are using GitLab container registry
+    - docker run -d -p 8000:8000 --name ${IMAGE_NAME} ${IMAGE_TAG}
+
+  needs: ["semgrep-sast", "secret_detection", "container_scanning"]
+
+ 
+ 
+finish:
+  stage: "finish"
+  tags:
+    - $RUNNER_TAG
+  script:
+    # clean up the space
+    -  docker system prune -a --volumes -f
